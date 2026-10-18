@@ -1,5 +1,5 @@
 BINARY := ssnap
-PKG    := ./cmd/ssnap
+PKG    := ./cmd
 
 .PHONY: build install test race vet fmt clean
 

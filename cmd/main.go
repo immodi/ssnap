@@ -10,7 +10,7 @@ package main
 import (
 	"os"
 
-	"ssnap/internal/ssnap"
+	"ssnap/internal"
 )
 
 func main() {

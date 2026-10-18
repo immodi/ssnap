@@ -36,11 +36,11 @@ original
 Requires Go 1.24 or newer.
 
 ```console
-# From a clone of this repository:
-go install ./cmd/ssnap
+# Build a local binary called ssnap:
+go build -o ssnap ./cmd
 
-# Or build a local binary:
-go build -o ssnap ./cmd/ssnap
+# Or install it (the binary is named "cmd" by default):
+go install ./cmd
 ```
 
 ## Usage
@@ -148,8 +148,8 @@ make fmt     # gofmt -w .
 The layout:
 
 ```
-cmd/ssnap/          thin main package
-internal/ssnap/     the implementation and tests
+cmd/          thin main package
+internal/     the implementation and tests
 ```
 
 ## License
