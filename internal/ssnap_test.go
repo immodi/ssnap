@@ -921,3 +921,284 @@ func TestRestoreAbortsWhenLowOnSpace(t *testing.T) {
 		t.Fatalf("want %q, got %q", "v1", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 10. ls
+// ---------------------------------------------------------------------------
+
+func TestLSListsSnapshots(t *testing.T) {
+	home := setHome(t)
+
+	// Nothing saved yet: prints nothing and exits 0.
+	code, out := captureOut(func() int { return Run([]string{"ls"}) })
+	if code != 0 {
+		t.Fatalf("ls (empty store) exit %d", code)
+	}
+	if out != "" {
+		t.Fatalf("ls (empty store) printed %q, want nothing", out)
+	}
+
+	base := t.TempDir()
+	a := filepath.Join(base, "a")
+	b := filepath.Join(base, "b")
+	writeFile(t, filepath.Join(a, "one.txt"), "hello", 0o644)
+	writeFile(t, filepath.Join(b, "two.txt"), "hello world", 0o644)
+	mustRun(t, "save", a)
+	mustRun(t, "save", b)
+
+	// Entries that are not valid snapshots are ignored: a stale temp directory
+	// and a directory without a meta.json.
+	if err := os.Mkdir(filepath.Join(storeDir(home), tmpPrefix+"stale"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(storeDir(home), "no-meta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A snapshot is listed even when its original directory is gone.
+	if err := os.RemoveAll(b); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out = captureOut(func() int { return Run([]string{"ls"}) })
+	if code != 0 {
+		t.Fatalf("ls exit %d: %s", code, out)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %q", len(lines), out)
+	}
+
+	// Sorted by path, with three tab-separated columns.
+	if !strings.HasPrefix(lines[0], a+"\t") {
+		t.Fatalf("first line = %q, want it to start with %q", lines[0], a)
+	}
+	cols := strings.Split(lines[0], "\t")
+	if len(cols) != 3 {
+		t.Fatalf("want 3 columns, got %d: %q", len(cols), lines[0])
+	}
+	if _, err := time.Parse(time.RFC3339, cols[1]); err != nil {
+		t.Fatalf("saved_at %q is not RFC 3339: %v", cols[1], err)
+	}
+	if cols[2] != "5 B" {
+		t.Fatalf("size column = %q, want %q", cols[2], "5 B")
+	}
+	if got := strings.Split(lines[1], "\t")[0]; got != b {
+		t.Fatalf("second path = %q, want %q", got, b)
+	}
+
+	// A dropped snapshot disappears from the listing.
+	mustRun(t, "drop", a)
+	code, out = captureOut(func() int { return Run([]string{"ls"}) })
+	if code != 0 {
+		t.Fatalf("ls exit %d: %s", code, out)
+	}
+	if !strings.HasPrefix(out, b+"\t") || strings.Count(out, "\n") != 1 {
+		t.Fatalf("after drop, ls = %q, want a single line for %q", out, b)
+	}
+}
+
+func TestSaveWritesMeta(t *testing.T) {
+	home := setHome(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "f"), "0123456789", 0o644) // 10 bytes
+
+	mustRun(t, "save", dir)
+
+	ids := snapshotDirs(t, storeDir(home))
+	if len(ids) != 1 {
+		t.Fatalf("want one snapshot, got %v", ids)
+	}
+	m, err := readMeta(filepath.Join(storeDir(home), ids[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.SizeBytes != 10 {
+		t.Fatalf("size_bytes = %d, want 10", m.SizeBytes)
+	}
+	if _, err := time.Parse(time.RFC3339, m.SavedAt); err != nil {
+		t.Fatalf("saved_at %q is not RFC 3339: %v", m.SavedAt, err)
+	}
+	if m.Path == "" {
+		t.Fatal("path is empty")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. inspect
+// ---------------------------------------------------------------------------
+
+func TestInspectReport(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "README.md"), strings.Repeat("a", 120), 0o644)
+	if err := os.Mkdir(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "src", "main.go"), strings.Repeat("b", 2210), 0o644)
+	mustSymlink(t, "src/main.go", filepath.Join(dir, "goodlink"))
+	mustSymlink(t, "nowhere", filepath.Join(dir, "dangling"))
+
+	mustRun(t, "save", dir)
+
+	// The saved column is checked separately since it carries the current time.
+	wantEntries := []string{
+		"-rw-r--r--       120  README.md",
+		"lrwxrwxrwx         -  dangling -> nowhere",
+		"lrwxrwxrwx         -  goodlink -> src/main.go",
+		"drwxr-xr-x         -  src/",
+		"-rw-r--r--      2210  src/main.go",
+	}
+
+	code, out := captureOut(func() int { return Run([]string{"inspect", dir}) })
+	if code != 0 {
+		t.Fatalf("inspect exit %d", code)
+	}
+	header, entries, ok := strings.Cut(out, "\n\n")
+	if !ok {
+		t.Fatalf("inspect output has no header/body separator:\n%s", out)
+	}
+	headerLines := strings.Split(header, "\n")
+	if len(headerLines) != 3 {
+		t.Fatalf("want 3 header lines, got %d: %q", len(headerLines), header)
+	}
+	if headerLines[0] != "path:   "+dir {
+		t.Fatalf("path header = %q", headerLines[0])
+	}
+	if !strings.HasPrefix(headerLines[1], "saved:  ") {
+		t.Fatalf("saved header = %q", headerLines[1])
+	}
+	if _, err := time.Parse(time.RFC3339, strings.TrimPrefix(headerLines[1], "saved:  ")); err != nil {
+		t.Fatalf("saved header not RFC 3339: %v", err)
+	}
+	if headerLines[2] != "totals: files 2, dirs 1, symlinks 2, 2.3 KiB" {
+		t.Fatalf("totals header = %q", headerLines[2])
+	}
+
+	gotEntries := strings.Split(strings.TrimRight(entries, "\n"), "\n")
+	if len(gotEntries) != len(wantEntries) {
+		t.Fatalf("got %d entries, want %d:\n%s", len(gotEntries), len(wantEntries), entries)
+	}
+	for i := range wantEntries {
+		if gotEntries[i] != wantEntries[i] {
+			t.Fatalf("entry %d = %q, want %q", i, gotEntries[i], wantEntries[i])
+		}
+	}
+
+	// inspect is read-only and still works after the original directory is gone.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	code, out2 := captureOut(func() int { return Run([]string{"inspect", dir}) })
+	if code != 0 || out2 != out {
+		t.Fatalf("inspect after delete: exit %d, output differs:\n%q\n%q", code, out, out2)
+	}
+}
+
+func TestInspectWithoutSnapshot(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+	out := wantErr(t, "inspect", dir)
+	if !strings.Contains(out, "no snapshot") {
+		t.Fatalf("unexpected message: %q", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 12. restore after the directory (or its parents) were deleted
+// ---------------------------------------------------------------------------
+
+func TestRestoreRecreatesDeletedDirectory(t *testing.T) {
+	setHome(t)
+	base := t.TempDir()
+	dir := filepath.Join(base, "work")
+	if err := os.Mkdir(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "keep.txt"), "keep", 0o644)
+	writeFile(t, filepath.Join(dir, "sub", "deep.txt"), "deep", 0o644)
+	mustSymlink(t, "keep.txt", filepath.Join(dir, "link"))
+
+	mustRun(t, "save", dir)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, "restore", dir)
+
+	if got := readFile(t, filepath.Join(dir, "keep.txt")); got != "keep" {
+		t.Fatalf("keep.txt: got %q, want %q", got, "keep")
+	}
+	if got := readFile(t, filepath.Join(dir, "sub", "deep.txt")); got != "deep" {
+		t.Fatalf("deep.txt: got %q, want %q", got, "deep")
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o750 {
+		t.Fatalf("dir perm = %o, want %o", fi.Mode().Perm(), 0o750)
+	}
+	if target, err := os.Readlink(filepath.Join(dir, "link")); err != nil || target != "keep.txt" {
+		t.Fatalf("link = %q, %v", target, err)
+	}
+}
+
+func TestRestoreRecreatesMissingParents(t *testing.T) {
+	setHome(t)
+	base := t.TempDir()
+	dir := filepath.Join(base, "a", "b", "c")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "f"), "v", 0o644)
+
+	mustRun(t, "save", dir)
+	// Wipe the whole path, not just the leaf.
+	if err := os.RemoveAll(filepath.Join(base, "a")); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, "restore", dir)
+
+	if got := readFile(t, filepath.Join(dir, "f")); got != "v" {
+		t.Fatalf("f: got %q, want %q", got, "v")
+	}
+	for _, p := range []string{filepath.Join(base, "a"), filepath.Join(base, "a", "b"), dir} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if !fi.IsDir() {
+			t.Fatalf("%s is not a directory", p)
+		}
+		if fi.Mode().Perm() != 0o755 {
+			t.Fatalf("%s perm = %o, want 0755", p, fi.Mode().Perm())
+		}
+	}
+}
+
+func TestRestoreRefusesFileAtPath(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "f"), "v", 0o644)
+	mustRun(t, "save", dir)
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "i am a file", 0o644)
+
+	out := wantErr(t, "restore", dir)
+	if !strings.Contains(out, "not a directory") {
+		t.Fatalf("unexpected message: %q", out)
+	}
+	if got := readFile(t, dir); got != "i am a file" {
+		t.Fatalf("file was modified: %q", got)
+	}
+}

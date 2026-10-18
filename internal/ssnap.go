@@ -1,10 +1,12 @@
 // Package ssnap snapshots the state of a directory and restores it later.
 //
-// It implements the three ssnap commands:
+// It implements the ssnap commands:
 //
 //	save <dir>      Record the current state of <dir> as its snapshot
 //	restore <dir>   Return <dir> to the state recorded by save
 //	drop <dir>      Delete the snapshot for <dir>
+//	ls              List every directory that has a snapshot
+//	inspect <dir>   Show what is recorded inside the snapshot of <dir>
 //
 // Snapshots are stored under ~/.ssnap/<id>, where <id> is a hash of the
 // absolute, symlink-resolved path of <dir>. Every operation is written to be
@@ -23,7 +25,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -81,20 +86,20 @@ func exchangeDirs(a, b string) error {
 var testCrash = os.Getenv("SSNAP_TEST_CRASH")
 var crashCount int
 
+const usage = "usage: ssnap <save|restore|drop|inspect> <dir>\n       ssnap ls"
+
 // meta describes a snapshot. It is written inside every snapshot directory.
 type meta struct {
-	Path string `json:"path"` // absolute, symlink-resolved path of the target
+	Path      string `json:"path"`       // absolute, symlink-resolved path of the target
+	SavedAt   string `json:"saved_at"`   // when the snapshot was taken (RFC 3339)
+	SizeBytes uint64 `json:"size_bytes"` // total size of the recorded regular files
 }
 
 // Run executes a single command line (the arguments after the program name)
 // and returns the process exit code.
 func Run(args []string) int {
-	if len(args) != 2 {
-		return fail("usage: ssnap <save|restore|drop> <dir>")
-	}
-	cmd, dir := args[0], args[1]
-	if dir == "" {
-		return fail("directory argument is empty")
+	if len(args) == 0 {
+		return fail(usage)
 	}
 
 	store, err := storePath()
@@ -102,25 +107,49 @@ func Run(args []string) int {
 		return fail(err.Error())
 	}
 
-	var msg string
-	switch cmd {
-	case "save":
-		err = save(store, dir)
-		msg = fmt.Sprintf("saved snapshot of %s", dir)
-	case "restore":
-		err = restore(store, dir)
-		msg = fmt.Sprintf("restored %s", dir)
-	case "drop":
-		err = drop(store, dir)
-		msg = fmt.Sprintf("dropped snapshot of %s", dir)
+	switch args[0] {
+	case "ls":
+		if len(args) != 1 {
+			return fail(usage)
+		}
+		if err := ls(store); err != nil {
+			return fail(err.Error())
+		}
+		return 0
+	case "save", "restore", "drop", "inspect":
+		if len(args) != 2 {
+			return fail(usage)
+		}
+		cmd, dir := args[0], args[1]
+		if dir == "" {
+			return fail("directory argument is empty")
+		}
+
+		var msg string
+		switch cmd {
+		case "save":
+			err = save(store, dir)
+			msg = fmt.Sprintf("saved snapshot of %s", dir)
+		case "restore":
+			err = restore(store, dir)
+			msg = fmt.Sprintf("restored %s", dir)
+		case "drop":
+			err = drop(store, dir)
+			msg = fmt.Sprintf("dropped snapshot of %s", dir)
+		case "inspect":
+			// inspect prints its own report; there is no confirmation line.
+			err = inspect(store, dir)
+		}
+		if err != nil {
+			return fail(err.Error())
+		}
+		if msg != "" {
+			fmt.Fprintln(stdout, msg)
+		}
+		return 0
 	default:
-		return fail("unknown command: " + cmd)
+		return fail("unknown command: " + args[0])
 	}
-	if err != nil {
-		return fail(err.Error())
-	}
-	fmt.Fprintln(stdout, msg)
-	return 0
 }
 
 func fail(msg string) int {
@@ -179,7 +208,11 @@ func save(store, dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := writeMeta(tmp, resolved); err != nil {
+	if err := writeMeta(tmp, meta{
+		Path:      resolved,
+		SavedAt:   time.Now().Format(time.RFC3339),
+		SizeBytes: need,
+	}); err != nil {
 		os.RemoveAll(tmp)
 		return err
 	}
@@ -207,36 +240,59 @@ func restore(store, dir string) error {
 	}
 	cleanupStore(store)
 
-	resolved, err := resolveDir(dir)
+	resolved, err := resolveExisting(dir)
 	if err != nil {
 		return fmt.Errorf("cannot resolve %q: %w", dir, err)
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return fmt.Errorf("cannot access %q: %w", dir, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("%q is not a directory", dir)
 	}
 	if err := refusePaths(resolved, store); err != nil {
 		return err
 	}
 
-	id := snapshotID(resolved)
-	snap := filepath.Join(store, id)
-	si, err := os.Stat(snap)
-	if err != nil || !si.IsDir() {
-		return fmt.Errorf("no snapshot for %q", dir)
+	// <dir> may have been deleted entirely. If anything is at the path it must
+	// be a directory; otherwise fail and leave it untouched.
+	var dirExists bool
+	switch fi, err := os.Lstat(resolved); {
+	case err == nil:
+		if !fi.IsDir() {
+			return fmt.Errorf("%q exists and is not a directory", dir)
+		}
+		dirExists = true
+	case errors.Is(err, os.ErrNotExist):
+		// Recreated below.
+	default:
+		return fmt.Errorf("cannot access %q: %w", dir, err)
 	}
 
-	parent := filepath.Dir(resolved)
+	id := snapshotID(resolved)
+	snap := filepath.Join(store, id)
+	if si, err := os.Stat(snap); err != nil || !si.IsDir() {
+		return fmt.Errorf("no snapshot for %q", dir)
+	}
 
 	// Guard against running out of space before building the temporary tree.
 	need, err := treeSize(filepath.Join(snap, treeDir))
 	if err != nil {
 		return fmt.Errorf("cannot size snapshot: %w", err)
 	}
-	if err := requireSpace(resolved, need); err != nil {
+	spaceAt := resolved
+	if !dirExists {
+		spaceAt = existingAncestor(resolved)
+	}
+	if err := requireSpace(spaceAt, need); err != nil {
+		return err
+	}
+
+	parent := filepath.Dir(resolved)
+
+	// If <dir> is missing, its parents may be missing too. Recreate them with
+	// mode 0755, remembering which ones we made so they can be removed again if
+	// the restore fails.
+	created, err := createParents(parent)
+	if err != nil {
+		return err
+	}
+	abort := func(err error) error {
+		removeEmpty(created)
 		return err
 	}
 
@@ -246,16 +302,25 @@ func restore(store, dir string) error {
 	// final swap is a rename on the same filesystem.
 	tmp, err := os.MkdirTemp(parent, restorePrefix)
 	if err != nil {
-		return err
+		return abort(err)
 	}
 	if err := copyDirInto(filepath.Join(snap, treeDir), tmp); err != nil {
 		os.RemoveAll(tmp)
-		return fmt.Errorf("restore aborted: %w", err)
+		return abort(fmt.Errorf("restore aborted: %w", err))
+	}
+
+	if !dirExists {
+		// <dir> is missing: simply rename the finished tree into place.
+		if err := os.Rename(tmp, resolved); err != nil {
+			os.RemoveAll(tmp)
+			return abort(err)
+		}
+		return nil
 	}
 
 	if err := swapDirs(tmp, resolved); err != nil {
 		os.RemoveAll(tmp)
-		return err
+		return abort(err)
 	}
 	// After a successful swap, tmp holds the previous contents of <dir>.
 	os.RemoveAll(tmp)
@@ -272,15 +337,11 @@ func drop(store, dir string) error {
 	}
 	cleanupStore(store)
 
-	resolved, err := resolveDir(dir)
+	// <dir> may already be gone; the snapshot id is derived from its path with
+	// symlinks resolved in whatever part of it still exists.
+	resolved, err := resolveExisting(dir)
 	if err != nil {
-		// The directory may already be gone; fall back to a lexical path so
-		// that a snapshot can still be dropped.
-		abs, aerr := filepath.Abs(dir)
-		if aerr != nil {
-			return fmt.Errorf("cannot resolve %q: %w", dir, aerr)
-		}
-		resolved = filepath.Clean(abs)
+		return fmt.Errorf("cannot resolve %q: %w", dir, err)
 	}
 
 	snap := filepath.Join(store, snapshotID(resolved))
@@ -297,16 +358,179 @@ func drop(store, dir string) error {
 }
 
 // ---------------------------------------------------------------------------
+// ls
+// ---------------------------------------------------------------------------
+
+// ls prints one line per saved directory: the original path, the time it was
+// saved, and the total size of the recorded files. It reads only each
+// snapshot's meta.json, never the trees, so it stays fast at any size.
+func ls(store string) error {
+	entries, err := os.ReadDir(store)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // nothing has been saved yet
+		}
+		return err
+	}
+
+	type row struct {
+		path  string
+		saved string
+		size  uint64
+	}
+	var rows []row
+	for _, e := range entries {
+		// Stale temp directories (and everything else dot-prefixed) are not
+		// snapshots.
+		if strings.HasPrefix(e.Name(), ".") || !e.IsDir() {
+			continue
+		}
+		m, err := readMeta(filepath.Join(store, e.Name()))
+		if err != nil || m.Path == "" {
+			continue // no valid meta.json: not a snapshot
+		}
+		rows = append(rows, row{path: m.Path, saved: m.SavedAt, size: m.SizeBytes})
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].path < rows[j].path })
+	for _, r := range rows {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\n", r.path, r.saved, humanSize(r.size))
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// inspect
+// ---------------------------------------------------------------------------
+
+// inspect prints what is recorded inside the snapshot of dir. It is read-only:
+// it touches neither the snapshot nor dir, and works even after dir is gone.
+func inspect(store, dir string) error {
+	resolved, err := resolveExisting(dir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve %q: %w", dir, err)
+	}
+
+	snap := filepath.Join(store, snapshotID(resolved))
+	if si, err := os.Stat(snap); err != nil || !si.IsDir() {
+		return fmt.Errorf("no snapshot for %q", dir)
+	}
+	m, err := readMeta(snap)
+	if err != nil {
+		return fmt.Errorf("no snapshot for %q", dir)
+	}
+
+	type entry struct {
+		path  string
+		mode  os.FileMode
+		size  int64
+		link  string
+		isDir bool
+	}
+
+	tree := filepath.Join(snap, treeDir)
+	var entries []entry
+	var files, dirs, links int
+	var total uint64
+	err = filepath.WalkDir(tree, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if p == tree {
+			return nil // the root itself is not listed
+		}
+		rel, err := filepath.Rel(tree, p)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		e := entry{path: filepath.ToSlash(rel), mode: info.Mode()}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			links++
+			if e.link, err = os.Readlink(p); err != nil {
+				return err
+			}
+		case info.IsDir():
+			dirs++
+			e.isDir = true
+		case info.Mode().IsRegular():
+			files++
+			e.size = info.Size()
+			total += uint64(info.Size())
+		}
+		entries = append(entries, e)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+
+	fmt.Fprintf(stdout, "path:   %s\n", m.Path)
+	fmt.Fprintf(stdout, "saved:  %s\n", m.SavedAt)
+	fmt.Fprintf(stdout, "totals: files %d, dirs %d, symlinks %d, %s\n", files, dirs, links, humanSize(total))
+	fmt.Fprintln(stdout)
+	for _, e := range entries {
+		size := "-"
+		if e.mode.IsRegular() {
+			size = strconv.FormatInt(e.size, 10)
+		}
+		name := e.path
+		if e.isDir {
+			name += "/"
+		}
+		if e.mode&os.ModeSymlink != 0 {
+			name += " -> " + e.link
+		}
+		fmt.Fprintf(stdout, "%s%10s  %s\n", modeString(e.mode), size, name)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // paths
 // ---------------------------------------------------------------------------
 
-// resolveDir returns the absolute, symlink-resolved form of dir.
+// resolveDir returns the absolute, symlink-resolved form of dir. It fails if
+// dir does not exist.
 func resolveDir(dir string) (string, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return "", err
 	}
 	return filepath.EvalSymlinks(filepath.Clean(abs))
+}
+
+// resolveExisting returns the absolute form of dir with symlinks resolved in
+// whatever part of the path exists. Unlike resolveDir it does not fail when the
+// path (or some of its parents) is missing, so it can derive the snapshot id of
+// a directory that has since been deleted.
+func resolveExisting(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+
+	// Walk up until we reach a component that exists, then resolve that prefix
+	// and re-attach the missing tail.
+	rest := ""
+	cur := abs
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil // reached the root without resolving anything
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // snapshotID derives the stable snapshot identifier for a resolved path.
@@ -323,12 +547,15 @@ func refusePaths(resolved, store string) error {
 	}
 
 	if home, err := os.UserHomeDir(); err == nil {
-		if hr := resolveMaybe(home); hr == resolved {
+		if hr, err := resolveExisting(home); err == nil && hr == resolved {
 			return errors.New("refusing to operate on the home directory")
 		}
 	}
 
-	storeResolved := resolveMaybe(store)
+	storeResolved, err := resolveExisting(store)
+	if err != nil {
+		storeResolved = filepath.Clean(store)
+	}
 	if resolved == storeResolved {
 		return errors.New("refusing to operate on the snapshot store")
 	}
@@ -339,23 +566,6 @@ func refusePaths(resolved, store string) error {
 		return errors.New("refusing to snapshot a directory that contains the snapshot store")
 	}
 	return nil
-}
-
-// resolveMaybe resolves symlinks, falling back to the cleaned absolute path
-// when resolution is not possible (for example, a path that does not exist).
-func resolveMaybe(path string) string {
-	if r, err := filepath.EvalSymlinks(path); err == nil {
-		return r
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return filepath.Clean(path)
-	}
-	// Resolve the parent so that a not-yet-created final component is handled.
-	if r, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
-		return filepath.Join(r, filepath.Base(abs))
-	}
-	return filepath.Clean(abs)
 }
 
 // isWithin reports whether child is parent itself or lies inside parent.
@@ -399,7 +609,11 @@ func cleanupStore(store string) {
 			// A previous snapshot may have been moved aside just before a
 			// crash. Put it back if its final home is now empty.
 			if m, err := readMeta(full); err == nil && m.Path != "" {
-				dest := filepath.Join(store, snapshotID(resolveMaybe(m.Path)))
+				path, err := resolveExisting(m.Path)
+				if err != nil {
+					path = filepath.Clean(m.Path)
+				}
+				dest := filepath.Join(store, snapshotID(path))
 				if _, err := os.Stat(dest); os.IsNotExist(err) {
 					if err := os.Rename(full, dest); err == nil {
 						continue
@@ -667,8 +881,8 @@ func maybeCrash(phase string) {
 // metadata
 // ---------------------------------------------------------------------------
 
-func writeMeta(dir, path string) error {
-	b, err := json.Marshal(meta{Path: path})
+func writeMeta(dir string, m meta) error {
+	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
@@ -685,4 +899,91 @@ func readMeta(dir string) (meta, error) {
 		return meta{}, err
 	}
 	return m, nil
+}
+
+// ---------------------------------------------------------------------------
+// restore helpers
+// ---------------------------------------------------------------------------
+
+// createParents creates any missing directories from the nearest existing
+// ancestor down to dir (mode 0755). It returns the directories it created, from
+// shallowest to deepest, so the caller can undo them.
+func createParents(dir string) ([]string, error) {
+	var missing []string
+	for cur := dir; ; {
+		if _, err := os.Lstat(cur); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		missing = append(missing, cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+
+	var created []string
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o755); err != nil {
+			removeEmpty(created)
+			return nil, err
+		}
+		created = append(created, missing[i])
+	}
+	return created, nil
+}
+
+// removeEmpty removes the given directories deepest-first, ignoring any that
+// are not empty or no longer exist.
+func removeEmpty(dirs []string) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		os.Remove(dirs[i])
+	}
+}
+
+// existingAncestor returns path if it exists, otherwise its nearest existing
+// ancestor.
+func existingAncestor(path string) string {
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path
+		}
+		path = parent
+	}
+}
+
+// ---------------------------------------------------------------------------
+// display helpers
+// ---------------------------------------------------------------------------
+
+// humanSize formats a byte count in binary units, e.g. "2.3 KiB".
+func humanSize(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+	f := float64(n)
+	i := 0
+	for f >= unit && i < len(units)-1 {
+		f /= unit
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", f, units[i])
+}
+
+// modeString renders a file mode the way ls -l does, e.g. "-rw-r--r--". Go
+// spells symlinks with an uppercase "L"; ls uses a lowercase "l".
+func modeString(m os.FileMode) string {
+	s := m.String()
+	if len(s) > 0 && s[0] == 'L' {
+		s = "l" + s[1:]
+	}
+	return s
 }
