@@ -1,12 +1,13 @@
-// Command ssnap snapshots a directory and restores it later.
+// Command ssnap snapshots a directory or regular file and restores it later.
 //
 // Usage:
 //
-//	ssnap save <dir>      Record the current state of <dir> as its snapshot
-//	ssnap restore <dir>   Return <dir> to the state recorded by save
-//	ssnap drop <dir>      Delete the snapshot for <dir>
-//	ssnap ls              List every directory that has a snapshot
-//	ssnap inspect <dir>   Show what is recorded inside the snapshot of <dir>
+//	ssnap save <path>              Record the current state of <path> as its snapshot
+//	ssnap restore <path>           Return <path> to the state recorded by save
+//	ssnap drop <path>              Delete the snapshot for <path>
+//	ssnap ls [-p page]             List every path that has a snapshot
+//	ssnap inspect <path> [-p page] Show what is recorded inside the snapshot of <path>
+//	ssnap help                     Show usage information
 package main
 
 import (

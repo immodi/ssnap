@@ -1,15 +1,17 @@
-// Package ssnap snapshots the state of a directory and restores it later.
+// Package ssnap snapshots the state of a directory or a regular file and
+// restores it later.
 //
 // It implements the ssnap commands:
 //
-//	save <dir>      Record the current state of <dir> as its snapshot
-//	restore <dir>   Return <dir> to the state recorded by save
-//	drop <dir>      Delete the snapshot for <dir>
-//	ls              List every directory that has a snapshot
-//	inspect <dir>   Show what is recorded inside the snapshot of <dir>
+//	save <path>      Record the current state of <path> as its snapshot
+//	restore <path>   Return <path> to the state recorded by save
+//	drop <path>      Delete the snapshot for <path>
+//	ls               List every path that has a snapshot
+//	inspect <path>   Show what is recorded inside the snapshot of <path>
+//	help             Show usage information
 //
 // Snapshots are stored under ~/.ssnap/<id>, where <id> is a hash of the
-// absolute, symlink-resolved path of <dir>. Every operation is written to be
+// absolute, symlink-resolved path of <path>. Every operation is written to be
 // atomic: a crash never leaves a half-written snapshot or a half-restored
 // directory behind.
 package ssnap
@@ -34,7 +36,16 @@ import (
 const (
 	storeName = ".ssnap"
 	metaFile  = "meta.json"
-	treeDir   = "tree"
+	treeDir   = "tree" // recorded tree of a directory snapshot
+	fileData  = "file" // recorded contents of a file snapshot
+
+	// Snapshot kinds. An empty kind in meta.json means a directory snapshot,
+	// for compatibility with snapshots written before files were supported.
+	kindDir  = "dir"
+	kindFile = "file"
+
+	// defaultPageSize is the number of ls rows or inspect entries per page.
+	defaultPageSize = 20
 
 	// Prefixes for the transient directories that live inside the store.
 	tmpPrefix  = ".tmp-"  // a snapshot being built
@@ -86,20 +97,59 @@ func exchangeDirs(a, b string) error {
 var testCrash = os.Getenv("SSNAP_TEST_CRASH")
 var crashCount int
 
-const usage = "usage: ssnap <save|restore|drop|inspect> <dir>\n       ssnap ls"
+const usage = `usage:
+  ssnap save <path>              Record <path> (a directory or regular file)
+  ssnap restore <path>           Return <path> to the state recorded by save
+  ssnap drop <path>              Delete the snapshot for <path>
+  ssnap ls [-p page]             List every path that has a snapshot
+  ssnap inspect <path> [-p page] Show what is recorded inside the snapshot
+  ssnap help                     Show this help
+
+options:
+  -p, --page N        Show page N (default 1)
+      --page-size N   Entries per page (default 20)`
+
+const helpText = usage + `
+
+Snapshots record a whole directory tree or a single regular file. save replaces
+any previous snapshot for the same path. restore leaves the snapshot in place
+and works even if <path> has been deleted. drop only removes the snapshot; the
+original path is not touched. ls and inspect are read-only.
+
+Pagination applies to ls and inspect. Pages are numbered from 1; a page past
+the end is an error.
+
+Run "ssnap <command>" with an invalid number of arguments to see this usage.`
 
 // meta describes a snapshot. It is written inside every snapshot directory.
 type meta struct {
-	Path      string `json:"path"`       // absolute, symlink-resolved path of the target
-	SavedAt   string `json:"saved_at"`   // when the snapshot was taken (RFC 3339)
-	SizeBytes uint64 `json:"size_bytes"` // total size of the recorded regular files
+	Path      string `json:"path"`           // absolute, symlink-resolved path of the target
+	Kind      string `json:"kind,omitempty"` // kindDir, kindFile, or empty (legacy directory)
+	SavedAt   string `json:"saved_at"`       // when the snapshot was taken (RFC 3339)
+	SizeBytes uint64 `json:"size_bytes"`     // total size of the recorded regular files
 }
+
+// isFile reports whether m describes a single-file snapshot.
+func (m meta) isFile() bool { return m.Kind == kindFile }
 
 // Run executes a single command line (the arguments after the program name)
 // and returns the process exit code.
 func Run(args []string) int {
 	if len(args) == 0 {
 		return fail(usage)
+	}
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(stdout, helpText)
+		return 0
+	}
+	for _, a := range args[1:] {
+		if a == "--" {
+			break
+		}
+		if a == "-h" || a == "--help" {
+			fmt.Fprintln(stdout, helpText)
+			return 0
+		}
 	}
 
 	store, err := storePath()
@@ -109,36 +159,48 @@ func Run(args []string) int {
 
 	switch args[0] {
 	case "ls":
-		if len(args) != 1 {
+		rest, opts, err := parsePageArgs(args[1:])
+		if err != nil {
+			return fail(err.Error())
+		}
+		if len(rest) != 0 {
 			return fail(usage)
 		}
-		if err := ls(store); err != nil {
+		if err := ls(store, opts); err != nil {
 			return fail(err.Error())
 		}
 		return 0
 	case "save", "restore", "drop", "inspect":
-		if len(args) != 2 {
+		cmd := args[0]
+		rest, opts, err := parsePageArgs(args[1:])
+		if err != nil {
+			return fail(err.Error())
+		}
+		if len(rest) != 1 {
 			return fail(usage)
 		}
-		cmd, dir := args[0], args[1]
-		if dir == "" {
-			return fail("directory argument is empty")
+		target := rest[0]
+		if target == "" {
+			return fail("path argument is empty")
+		}
+		if cmd != "inspect" && (opts.pageSet || opts.sizeSet) {
+			return fail("pagination is only supported by ls and inspect")
 		}
 
 		var msg string
 		switch cmd {
 		case "save":
-			err = save(store, dir)
-			msg = fmt.Sprintf("saved snapshot of %s", dir)
+			err = save(store, target)
+			msg = fmt.Sprintf("saved snapshot of %s", target)
 		case "restore":
-			err = restore(store, dir)
-			msg = fmt.Sprintf("restored %s", dir)
+			err = restore(store, target)
+			msg = fmt.Sprintf("restored %s", target)
 		case "drop":
-			err = drop(store, dir)
-			msg = fmt.Sprintf("dropped snapshot of %s", dir)
+			err = drop(store, target)
+			msg = fmt.Sprintf("dropped snapshot of %s", target)
 		case "inspect":
 			// inspect prints its own report; there is no confirmation line.
-			err = inspect(store, dir)
+			err = inspect(store, target, opts)
 		}
 		if err != nil {
 			return fail(err.Error())
@@ -157,6 +219,162 @@ func fail(msg string) int {
 	return 1
 }
 
+// ---------------------------------------------------------------------------
+// pagination
+// ---------------------------------------------------------------------------
+
+// pageOpts describes how output should be paged. A zero pageOpts (paginated
+// false) prints everything.
+type pageOpts struct {
+	page      int
+	size      int
+	paginated bool
+	pageSet   bool
+	sizeSet   bool
+}
+
+// parsePageArgs separates -p/--page and --page-size options from positional
+// arguments. Flags may appear before or after the path. A page value may also
+// carry an explicit size, as in "-p 2:10".
+func parsePageArgs(args []string) ([]string, pageOpts, error) {
+	opts := pageOpts{page: 1, size: defaultPageSize}
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			positional = append(positional, args[i+1:]...)
+			return positional, opts, nil
+		case arg == "-p" || arg == "--page":
+			// A bare -p means the first page; a value selects another page.
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				opts.page, opts.pageSet, opts.paginated = 1, true, true
+				continue
+			}
+			i++
+			p, size, hasSize, err := parsePageValue(args[i])
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.page, opts.pageSet, opts.paginated = p, true, true
+			if hasSize {
+				opts.size, opts.sizeSet = size, true
+			}
+		case strings.HasPrefix(arg, "--page="):
+			p, size, hasSize, err := parsePageValue(strings.TrimPrefix(arg, "--page="))
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.page, opts.pageSet, opts.paginated = p, true, true
+			if hasSize {
+				opts.size, opts.sizeSet = size, true
+			}
+		case strings.HasPrefix(arg, "-p="):
+			p, size, hasSize, err := parsePageValue(strings.TrimPrefix(arg, "-p="))
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.page, opts.pageSet, opts.paginated = p, true, true
+			if hasSize {
+				opts.size, opts.sizeSet = size, true
+			}
+		case len(arg) > 2 && strings.HasPrefix(arg, "-p") && !strings.HasPrefix(arg, "--"):
+			p, size, hasSize, err := parsePageValue(arg[2:])
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.page, opts.pageSet, opts.paginated = p, true, true
+			if hasSize {
+				opts.size, opts.sizeSet = size, true
+			}
+		case arg == "--page-size" || arg == "-n" || arg == "-s" || arg == "--per-page":
+			if i+1 >= len(args) {
+				return nil, opts, fmt.Errorf("%s requires a page size", arg)
+			}
+			i++
+			size, err := parsePositiveInt(args[i], "page size")
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.size, opts.sizeSet, opts.paginated = size, true, true
+		case strings.HasPrefix(arg, "--page-size="):
+			size, err := parsePositiveInt(strings.TrimPrefix(arg, "--page-size="), "page size")
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.size, opts.sizeSet, opts.paginated = size, true, true
+		case strings.HasPrefix(arg, "--per-page="):
+			size, err := parsePositiveInt(strings.TrimPrefix(arg, "--per-page="), "page size")
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.size, opts.sizeSet, opts.paginated = size, true, true
+		case strings.HasPrefix(arg, "-n=") || strings.HasPrefix(arg, "-s="):
+			size, err := parsePositiveInt(arg[3:], "page size")
+			if err != nil {
+				return nil, opts, err
+			}
+			opts.size, opts.sizeSet, opts.paginated = size, true, true
+		case arg == "-" || !strings.HasPrefix(arg, "-"):
+			positional = append(positional, arg)
+		default:
+			return nil, opts, fmt.Errorf("unknown option: %s", arg)
+		}
+	}
+	return positional, opts, nil
+}
+
+// parsePageValue parses "N" or "N:SIZE" (also N/SIZE and N,SIZE).
+func parsePageValue(v string) (page, size int, hasSize bool, err error) {
+	if i := strings.IndexAny(v, ":/,"); i >= 0 {
+		page, err = parsePositiveInt(v[:i], "page")
+		if err != nil {
+			return 0, 0, false, err
+		}
+		size, err = parsePositiveInt(v[i+1:], "page size")
+		if err != nil {
+			return 0, 0, false, err
+		}
+		return page, size, true, nil
+	}
+	page, err = parsePositiveInt(v, "page")
+	return page, 0, false, err
+}
+
+func parsePositiveInt(v, what string) (int, error) {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", what, v)
+	}
+	return n, nil
+}
+
+// pageRange returns the half-open range of items on the selected page. It
+// returns an error when the requested page does not exist.
+func pageRange(n int, opts pageOpts) (int, int, error) {
+	if !opts.paginated {
+		return 0, n, nil
+	}
+	if n == 0 {
+		if opts.page == 1 {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("page %d is out of range: there is nothing to show", opts.page)
+	}
+	pages := (n + opts.size - 1) / opts.size
+	if opts.page > pages {
+		return 0, 0, fmt.Errorf("page %d is out of range: only %d page(s) of %d entries",
+			opts.page, pages, opts.size)
+	}
+	start := (opts.page - 1) * opts.size
+	end := start + opts.size
+	if end > n {
+		end = n
+	}
+	return start, end, nil
+}
+
 // storePath returns the directory that holds all snapshots.
 func storePath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -170,31 +388,41 @@ func storePath() (string, error) {
 // save
 // ---------------------------------------------------------------------------
 
-func save(store, dir string) error {
+func save(store, target string) error {
 	if err := ensureStore(store); err != nil {
 		return err
 	}
 	cleanupStore(store)
 
-	resolved, err := resolveDir(dir)
+	resolved, err := resolveDir(target)
 	if err != nil {
-		return fmt.Errorf("cannot resolve %q: %w", dir, err)
+		return fmt.Errorf("cannot resolve %q: %w", target, err)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return fmt.Errorf("cannot access %q: %w", dir, err)
+		return fmt.Errorf("cannot access %q: %w", target, err)
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("%q is not a directory", dir)
+
+	kind := ""
+	switch {
+	case info.IsDir():
+		kind = kindDir
+	case info.Mode().IsRegular():
+		kind = kindFile
+	default:
+		return fmt.Errorf("%q is not a directory or regular file", target)
 	}
 	if err := refusePaths(resolved, store); err != nil {
 		return err
 	}
 
 	// Guard against running out of space before writing anything.
-	need, err := treeSize(resolved)
-	if err != nil {
-		return fmt.Errorf("cannot size %q: %w", dir, err)
+	need := uint64(info.Size())
+	if kind == kindDir {
+		need, err = treeSize(resolved)
+		if err != nil {
+			return fmt.Errorf("cannot size %q: %w", target, err)
+		}
 	}
 	if err := requireSpace(store, need); err != nil {
 		return err
@@ -210,16 +438,28 @@ func save(store, dir string) error {
 	}
 	if err := writeMeta(tmp, meta{
 		Path:      resolved,
+		Kind:      kind,
 		SavedAt:   time.Now().Format(time.RFC3339),
 		SizeBytes: need,
 	}); err != nil {
 		os.RemoveAll(tmp)
 		return err
 	}
-	if err := copyTree(resolved, filepath.Join(tmp, treeDir), "save"); err != nil {
+
+	var copyErr error
+	if kind == kindFile {
+		// Two hook calls keep single-file saves testable with the same crash
+		// mechanism used for trees (which visit at least a root and an entry).
+		maybeCrash("save")
+		copyErr = copyFile(resolved, filepath.Join(tmp, fileData), info)
+		maybeCrash("save")
+	} else {
+		copyErr = copyTree(resolved, filepath.Join(tmp, treeDir), "save")
+	}
+	if copyErr != nil {
 		// Leave nothing half-written: the previous snapshot is untouched.
 		os.RemoveAll(tmp)
-		return fmt.Errorf("save aborted: %w", err)
+		return fmt.Errorf("save aborted: %w", copyErr)
 	}
 
 	// Swap the finished snapshot into place as the final step.
@@ -234,39 +474,49 @@ func save(store, dir string) error {
 // restore
 // ---------------------------------------------------------------------------
 
-func restore(store, dir string) error {
+func restore(store, target string) error {
 	if err := ensureStore(store); err != nil {
 		return err
 	}
 	cleanupStore(store)
 
-	resolved, err := resolveExisting(dir)
+	// <path> may already be gone; the snapshot id is derived from its path with
+	// symlinks resolved in whatever part of it still exists.
+	resolved, err := resolveExisting(target)
 	if err != nil {
-		return fmt.Errorf("cannot resolve %q: %w", dir, err)
+		return fmt.Errorf("cannot resolve %q: %w", target, err)
 	}
 	if err := refusePaths(resolved, store); err != nil {
 		return err
 	}
 
-	// <dir> may have been deleted entirely. If anything is at the path it must
+	snap := filepath.Join(store, snapshotID(resolved))
+	m, err := readMeta(snap)
+	if err != nil || m.Path == "" {
+		return fmt.Errorf("no snapshot for %q", target)
+	}
+
+	if m.isFile() {
+		return restoreFile(target, resolved, snap)
+	}
+	return restoreDir(target, resolved, snap)
+}
+
+// restoreDir restores a directory snapshot into the given resolved path.
+func restoreDir(target, resolved, snap string) error {
+	// <path> may have been deleted entirely. If anything is at the path it must
 	// be a directory; otherwise fail and leave it untouched.
 	var dirExists bool
 	switch fi, err := os.Lstat(resolved); {
 	case err == nil:
 		if !fi.IsDir() {
-			return fmt.Errorf("%q exists and is not a directory", dir)
+			return fmt.Errorf("%q exists and is not a directory", target)
 		}
 		dirExists = true
 	case errors.Is(err, os.ErrNotExist):
 		// Recreated below.
 	default:
-		return fmt.Errorf("cannot access %q: %w", dir, err)
-	}
-
-	id := snapshotID(resolved)
-	snap := filepath.Join(store, id)
-	if si, err := os.Stat(snap); err != nil || !si.IsDir() {
-		return fmt.Errorf("no snapshot for %q", dir)
+		return fmt.Errorf("cannot access %q: %w", target, err)
 	}
 
 	// Guard against running out of space before building the temporary tree.
@@ -284,7 +534,7 @@ func restore(store, dir string) error {
 
 	parent := filepath.Dir(resolved)
 
-	// If <dir> is missing, its parents may be missing too. Recreate them with
+	// If <path> is missing, its parents may be missing too. Recreate them with
 	// mode 0755, remembering which ones we made so they can be removed again if
 	// the restore fails.
 	created, err := createParents(parent)
@@ -298,7 +548,7 @@ func restore(store, dir string) error {
 
 	cleanupSiblings(parent)
 
-	// Build the restored tree in a temporary sibling of <dir>, so that the
+	// Build the restored tree in a temporary sibling of <path>, so that the
 	// final swap is a rename on the same filesystem.
 	tmp, err := os.MkdirTemp(parent, restorePrefix)
 	if err != nil {
@@ -310,7 +560,7 @@ func restore(store, dir string) error {
 	}
 
 	if !dirExists {
-		// <dir> is missing: simply rename the finished tree into place.
+		// <path> is missing: simply rename the finished tree into place.
 		if err := os.Rename(tmp, resolved); err != nil {
 			os.RemoveAll(tmp)
 			return abort(err)
@@ -322,8 +572,67 @@ func restore(store, dir string) error {
 		os.RemoveAll(tmp)
 		return abort(err)
 	}
-	// After a successful swap, tmp holds the previous contents of <dir>.
+	// After a successful swap, tmp holds the previous contents of <path>.
 	os.RemoveAll(tmp)
+	return nil
+}
+
+// restoreFile restores a single-file snapshot into the given resolved path.
+// The new contents are built next to the target and renamed into place, so a
+// crash never leaves a half-written file behind.
+func restoreFile(target, resolved, snap string) error {
+	data := filepath.Join(snap, fileData)
+	info, err := os.Lstat(data)
+	if err != nil {
+		return fmt.Errorf("snapshot for %q is incomplete: %w", target, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("snapshot for %q is incomplete: recorded file is not regular", target)
+	}
+
+	// If something is at the path it must not be a directory; otherwise fail
+	// and leave it untouched.
+	switch fi, err := os.Lstat(resolved); {
+	case err == nil:
+		if fi.IsDir() {
+			return fmt.Errorf("%q exists and is a directory", target)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// Recreated below.
+	default:
+		return fmt.Errorf("cannot access %q: %w", target, err)
+	}
+
+	if err := requireSpace(existingAncestor(filepath.Dir(resolved)), uint64(info.Size())); err != nil {
+		return err
+	}
+
+	parent := filepath.Dir(resolved)
+
+	// Recreate missing parents, remembering them so a failed restore can undo
+	// them.
+	created, err := createParents(parent)
+	if err != nil {
+		return err
+	}
+	abort := func(err error) error {
+		removeEmpty(created)
+		return err
+	}
+
+	cleanupSiblings(parent)
+
+	tmp := filepath.Join(parent, randName(restorePrefix))
+	maybeCrash("restore")
+	if err := copyFile(data, tmp, info); err != nil {
+		os.Remove(tmp)
+		return abort(fmt.Errorf("restore aborted: %w", err))
+	}
+	maybeCrash("restore")
+	if err := os.Rename(tmp, resolved); err != nil {
+		os.Remove(tmp)
+		return abort(err)
+	}
 	return nil
 }
 
@@ -361,10 +670,10 @@ func drop(store, dir string) error {
 // ls
 // ---------------------------------------------------------------------------
 
-// ls prints one line per saved directory: the original path, the time it was
-// saved, and the total size of the recorded files. It reads only each
-// snapshot's meta.json, never the trees, so it stays fast at any size.
-func ls(store string) error {
+// ls prints one line per saved path: the original path, the time it was saved,
+// and the total size of the recorded files. It reads only each snapshot's
+// meta.json, never the trees, so it stays fast at any size.
+func ls(store string, opts pageOpts) error {
 	entries, err := os.ReadDir(store)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -393,7 +702,11 @@ func ls(store string) error {
 	}
 
 	sort.Slice(rows, func(i, j int) bool { return rows[i].path < rows[j].path })
-	for _, r := range rows {
+	start, end, err := pageRange(len(rows), opts)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows[start:end] {
 		fmt.Fprintf(stdout, "%s\t%s\t%s\n", r.path, r.saved, humanSize(r.size))
 	}
 	return nil
@@ -403,78 +716,100 @@ func ls(store string) error {
 // inspect
 // ---------------------------------------------------------------------------
 
-// inspect prints what is recorded inside the snapshot of dir. It is read-only:
-// it touches neither the snapshot nor dir, and works even after dir is gone.
-func inspect(store, dir string) error {
-	resolved, err := resolveExisting(dir)
+// inspectEntry is one line of an inspect report.
+type inspectEntry struct {
+	path  string
+	mode  os.FileMode
+	size  int64
+	link  string
+	isDir bool
+}
+
+// inspect prints what is recorded inside the snapshot of target. It is
+// read-only: it touches neither the snapshot nor target, and works even after
+// target is gone.
+func inspect(store, target string, opts pageOpts) error {
+	resolved, err := resolveExisting(target)
 	if err != nil {
-		return fmt.Errorf("cannot resolve %q: %w", dir, err)
+		return fmt.Errorf("cannot resolve %q: %w", target, err)
 	}
 
 	snap := filepath.Join(store, snapshotID(resolved))
 	if si, err := os.Stat(snap); err != nil || !si.IsDir() {
-		return fmt.Errorf("no snapshot for %q", dir)
+		return fmt.Errorf("no snapshot for %q", target)
 	}
 	m, err := readMeta(snap)
 	if err != nil {
-		return fmt.Errorf("no snapshot for %q", dir)
+		return fmt.Errorf("no snapshot for %q", target)
 	}
 
-	type entry struct {
-		path  string
-		mode  os.FileMode
-		size  int64
-		link  string
-		isDir bool
-	}
-
-	tree := filepath.Join(snap, treeDir)
-	var entries []entry
+	var entries []inspectEntry
 	var files, dirs, links int
 	var total uint64
-	err = filepath.WalkDir(tree, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if p == tree {
-			return nil // the root itself is not listed
-		}
-		rel, err := filepath.Rel(tree, p)
+
+	if m.isFile() {
+		info, err := os.Lstat(filepath.Join(snap, fileData))
 		if err != nil {
-			return err
+			return fmt.Errorf("snapshot for %q is incomplete: %w", target, err)
 		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		e := entry{path: filepath.ToSlash(rel), mode: info.Mode()}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			links++
-			if e.link, err = os.Readlink(p); err != nil {
+		files = 1
+		total = uint64(info.Size())
+		entries = append(entries, inspectEntry{
+			path: filepath.Base(m.Path),
+			mode: info.Mode(),
+			size: info.Size(),
+		})
+	} else {
+		tree := filepath.Join(snap, treeDir)
+		err = filepath.WalkDir(tree, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if p == tree {
+				return nil // the root itself is not listed
+			}
+			rel, err := filepath.Rel(tree, p)
+			if err != nil {
 				return err
 			}
-		case info.IsDir():
-			dirs++
-			e.isDir = true
-		case info.Mode().IsRegular():
-			files++
-			e.size = info.Size()
-			total += uint64(info.Size())
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			e := inspectEntry{path: filepath.ToSlash(rel), mode: info.Mode()}
+			switch {
+			case info.Mode()&os.ModeSymlink != 0:
+				links++
+				if e.link, err = os.Readlink(p); err != nil {
+					return err
+				}
+			case info.IsDir():
+				dirs++
+				e.isDir = true
+			case info.Mode().IsRegular():
+				files++
+				e.size = info.Size()
+				total += uint64(info.Size())
+			}
+			entries = append(entries, e)
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		entries = append(entries, e)
-		return nil
-	})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+
+	start, end, err := pageRange(len(entries), opts)
 	if err != nil {
 		return err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
 
 	fmt.Fprintf(stdout, "path:   %s\n", m.Path)
 	fmt.Fprintf(stdout, "saved:  %s\n", m.SavedAt)
 	fmt.Fprintf(stdout, "totals: files %d, dirs %d, symlinks %d, %s\n", files, dirs, links, humanSize(total))
 	fmt.Fprintln(stdout)
-	for _, e := range entries {
+	for _, e := range entries[start:end] {
 		size := "-"
 		if e.mode.IsRegular() {
 			size = strconv.FormatInt(e.size, 10)
@@ -560,10 +895,10 @@ func refusePaths(resolved, store string) error {
 		return errors.New("refusing to operate on the snapshot store")
 	}
 	if isWithin(resolved, storeResolved) {
-		return errors.New("refusing to operate on a directory inside the snapshot store")
+		return errors.New("refusing to operate on a path inside the snapshot store")
 	}
 	if isWithin(storeResolved, resolved) {
-		return errors.New("refusing to snapshot a directory that contains the snapshot store")
+		return errors.New("refusing to snapshot a path that contains the snapshot store")
 	}
 	return nil
 }

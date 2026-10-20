@@ -2,6 +2,7 @@ package ssnap
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -1200,5 +1201,270 @@ func TestRestoreRefusesFileAtPath(t *testing.T) {
 	}
 	if got := readFile(t, dir); got != "i am a file" {
 		t.Fatalf("file was modified: %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 13. single-file snapshots
+// ---------------------------------------------------------------------------
+
+func TestFileSnapshotRoundTrip(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+	writeFile(t, path, "original", 0o640)
+
+	mt := time.Date(2021, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(path, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+
+	mustRun(t, "save", path)
+
+	// Modify the file, then restore it.
+	writeFile(t, path, "oops", 0o600)
+	mustRun(t, "restore", path)
+	if got := readFile(t, path); got != "original" {
+		t.Fatalf("content = %q, want %q", got, "original")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o640 {
+		t.Fatalf("perm = %o, want 640", fi.Mode().Perm())
+	}
+	if !fi.ModTime().Equal(mt) {
+		t.Fatalf("mtime = %v, want %v", fi.ModTime(), mt)
+	}
+
+	// Delete it entirely, then restore it again.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, "restore", path)
+	if got := readFile(t, path); got != "original" {
+		t.Fatalf("restored content = %q, want %q", got, "original")
+	}
+
+	// The snapshot is dropped independently of the file.
+	mustRun(t, "drop", path)
+	if !exists(path) {
+		t.Fatal("drop removed the original file")
+	}
+	if out := wantErr(t, "restore", path); !strings.Contains(out, "no snapshot") {
+		t.Fatalf("unexpected message after drop: %q", out)
+	}
+}
+
+func TestFileSnapshotRecreatesMissingParents(t *testing.T) {
+	setHome(t)
+	base := t.TempDir()
+	path := filepath.Join(base, "a", "b", "note.txt")
+	writeFile(t, path, "deep", 0o644)
+
+	mustRun(t, "save", path)
+	if err := os.RemoveAll(filepath.Join(base, "a")); err != nil {
+		t.Fatal(err)
+	}
+
+	mustRun(t, "restore", path)
+	if got := readFile(t, path); got != "deep" {
+		t.Fatalf("content = %q, want %q", got, "deep")
+	}
+	for _, p := range []string{filepath.Join(base, "a"), filepath.Join(base, "a", "b")} {
+		fi, err := os.Stat(p)
+		if err != nil || !fi.IsDir() {
+			t.Fatalf("%s was not recreated: %v", p, err)
+		}
+	}
+}
+
+func TestFileSnapshotReplacesPrevious(t *testing.T) {
+	setHome(t)
+	path := filepath.Join(t.TempDir(), "f")
+	writeFile(t, path, "v1", 0o644)
+	mustRun(t, "save", path)
+
+	writeFile(t, path, "v2", 0o644)
+	mustRun(t, "save", path)
+	writeFile(t, path, "clobbered", 0o644)
+	mustRun(t, "restore", path)
+
+	if got := readFile(t, path); got != "v2" {
+		t.Fatalf("content = %q, want %q", got, "v2")
+	}
+}
+
+func TestFileSnapshotRestoreRefusesDirectory(t *testing.T) {
+	setHome(t)
+	path := filepath.Join(t.TempDir(), "thing")
+	writeFile(t, path, "file", 0o644)
+	mustRun(t, "save", path)
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out := wantErr(t, "restore", path)
+	if !strings.Contains(out, "is a directory") {
+		t.Fatalf("unexpected message: %q", out)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("directory was modified: %v", err)
+	}
+}
+
+func TestInspectFileReport(t *testing.T) {
+	setHome(t)
+	path := filepath.Join(t.TempDir(), "note.txt")
+	writeFile(t, path, strings.Repeat("x", 123), 0o600)
+	mustRun(t, "save", path)
+
+	code, out := captureOut(func() int { return Run([]string{"inspect", path}) })
+	if code != 0 {
+		t.Fatalf("inspect exit %d", code)
+	}
+	header, body, ok := strings.Cut(out, "\n\n")
+	if !ok {
+		t.Fatalf("inspect output has no header/body separator:\n%s", out)
+	}
+	lines := strings.Split(header, "\n")
+	if lines[0] != "path:   "+path {
+		t.Fatalf("path header = %q", lines[0])
+	}
+	if lines[2] != "totals: files 1, dirs 0, symlinks 0, 123 B" {
+		t.Fatalf("totals header = %q", lines[2])
+	}
+	if got, want := body, "-rw-------       123  note.txt\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+
+	// inspect is read-only and still works after the file is gone.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	code, out2 := captureOut(func() int { return Run([]string{"inspect", path}) })
+	if code != 0 || out2 != out {
+		t.Fatalf("inspect after delete: exit %d, output differs:\n%q\n%q", code, out, out2)
+	}
+}
+
+func TestLSIncludesFileSnapshot(t *testing.T) {
+	setHome(t)
+	path := filepath.Join(t.TempDir(), "note.txt")
+	writeFile(t, path, "hello", 0o644)
+	mustRun(t, "save", path)
+
+	code, out := captureOut(func() int { return Run([]string{"ls"}) })
+	if code != 0 {
+		t.Fatalf("ls exit %d", code)
+	}
+	cols := strings.Split(strings.TrimRight(out, "\n"), "\t")
+	if len(cols) != 3 || cols[0] != path || cols[2] != "5 B" {
+		t.Fatalf("ls = %q", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 14. help and pagination
+// ---------------------------------------------------------------------------
+
+func TestHelpCommand(t *testing.T) {
+	setHome(t)
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}} {
+		code, out := captureOut(func() int { return Run(args) })
+		if code != 0 {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+		for _, want := range []string{"usage:", "ssnap save", "ssnap inspect", "-p, --page", "--page-size"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("%v output missing %q:\n%s", args, want, out)
+			}
+		}
+	}
+
+	code, out := capture(func() int { return Run(nil) })
+	if code != 1 || !strings.Contains(out, "usage:") {
+		t.Fatalf("no arguments: exit %d, output %q", code, out)
+	}
+}
+
+func TestPagination(t *testing.T) {
+	setHome(t)
+	dir := t.TempDir()
+	for i := 0; i < 45; i++ {
+		writeFile(t, filepath.Join(dir, fmt.Sprintf("f%02d", i)), "x", 0o644)
+	}
+	mustRun(t, "save", dir)
+
+	// The inspect header is always printed in full; only entries are paged.
+	_, all := captureOut(func() int { return Run([]string{"inspect", dir}) })
+	header, allBody, _ := strings.Cut(all, "\n\n")
+	if n := strings.Count(strings.TrimRight(allBody, "\n"), "\n") + 1; n != 45 {
+		t.Fatalf("unpaged inspect has %d entries, want 45", n)
+	}
+
+	_, p1 := captureOut(func() int { return Run([]string{"inspect", dir, "-p", "1"}) })
+	h1, body1, _ := strings.Cut(p1, "\n\n")
+	if h1 != header {
+		t.Fatalf("page 1 header differs:\n%q\n%q", header, h1)
+	}
+	if n := strings.Count(strings.TrimRight(body1, "\n"), "\n") + 1; n != defaultPageSize {
+		t.Fatalf("page 1 has %d entries, want %d", n, defaultPageSize)
+	}
+
+	_, p3 := captureOut(func() int { return Run([]string{"inspect", dir, "-p", "3"}) })
+	_, body3, _ := strings.Cut(p3, "\n\n")
+	if n := strings.Count(strings.TrimRight(body3, "\n"), "\n") + 1; n != 5 {
+		t.Fatalf("page 3 has %d entries, want 5", n)
+	}
+	if !strings.Contains(body3, "f40") || strings.Contains(body3, "f04") {
+		t.Fatalf("unexpected page 3 contents:\n%s", body3)
+	}
+
+	// An explicit page size and the option=value forms work too.
+	for _, args := range [][]string{
+		{"inspect", dir, "--page-size", "10", "-p", "2"},
+		{"inspect", dir, "--page-size=10", "--page=2"},
+		{"inspect", dir, "-p", "2:10"},
+	} {
+		code, out := captureOut(func() int { return Run(args) })
+		if code != 0 {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+		_, body, _ := strings.Cut(out, "\n\n")
+		if n := strings.Count(strings.TrimRight(body, "\n"), "\n") + 1; n != 10 {
+			t.Fatalf("%v: %d entries, want 10", args, n)
+		}
+		if !strings.Contains(body, "f10") || strings.Contains(body, "f00") {
+			t.Fatalf("%v: unexpected page contents:\n%s", args, body)
+		}
+	}
+
+	// A page past the end is an error.
+	if out := wantErr(t, "inspect", dir, "-p", "4"); !strings.Contains(out, "out of range") {
+		t.Fatalf("unexpected message: %q", out)
+	}
+
+	// ls paginates its rows the same way.
+	for i := 0; i < 3; i++ {
+		p := filepath.Join(t.TempDir(), fmt.Sprintf("file%d", i))
+		writeFile(t, p, "x", 0o644)
+		mustRun(t, "save", p)
+	}
+	code, out := captureOut(func() int { return Run([]string{"ls", "--page-size", "2", "-p", "2"}) })
+	if code != 0 {
+		t.Fatalf("ls page 2: exit %d", code)
+	}
+	if n := strings.Count(strings.TrimRight(out, "\n"), "\n") + 1; n != 2 {
+		t.Fatalf("ls page 2 has %d rows, want 2: %q", n, out)
+	}
+	if out := wantErr(t, "ls", "-p", "3"); !strings.Contains(out, "out of range") {
+		t.Fatalf("unexpected message: %q", out)
 	}
 }
